@@ -1,24 +1,29 @@
 import EventEmitter from 'node:events';
-import { type Provider, type AwsCredentialIdentity, type Command } from '@smithy/types';
+import { setTimeout as schedule, clearTimeout } from 'node:timers';
+import { type Provider, type AwsCredentialIdentity } from '@smithy/types';
 import {
   SQSClient,
   type SQSClientConfig,
   type ReceiveMessageCommandInput,
   type DeleteMessageCommandInput,
   type Message,
-  // type ReceiveMessageCommandOutput,
   ReceiveMessageCommand,
   DeleteMessageBatchCommand,
   DeleteMessageBatchRequestEntry,
-  // ReceiveMessageResult,
-  // DeleteMessageCommand,
-  // ReceiveMessageCommandOutput,
 } from '@aws-sdk/client-sqs';
 
+type Timeout = ReturnType<typeof schedule>;
+
+type Done = () => void;
 export interface PollingConfig {
   intervalSeconds?: number
 }
 
+export type HandlerReturnType = boolean|undefined|Promise<boolean>|Promise<undefined>
+export type HandlerCallbackType = (err: Error, result: boolean[]) => void;
+export type HandlerType = (messages: Message[], callback?: HandlerCallbackType) => HandlerReturnType
+export type AckHandler = (messages: Message[]) => void
+export type DefaultAckHandler = () => void
 export interface Options {
   ackHandler?: AckHandler,
   ack?: boolean,
@@ -29,12 +34,6 @@ export interface Options {
   receiveMessageInput?: ReceiveMessageCommandInput
   deleteMessageInput?: DeleteMessageCommandInput
 }
-
-export type HandlerReturnType = boolean|undefined|Promise<boolean>|Promise<undefined>
-export type HandlerCallbackType = (err: Error, result: boolean) => void;
-export type HandlerType = (messages: Message[], callback?: HandlerCallbackType) => HandlerReturnType
-export type AckHandler = (messages: Message[]) => void
-export type DefaultAckHandler = () => void
 
 function getPollingWithDefaults(config: PollingConfig = {}): PollingConfig {
   const cnf: PollingConfig = {
@@ -72,6 +71,10 @@ function isPromise<T>(p: unknown): p is Promise<T> {
   return p?.constructor?.name === 'Promise';
 }
 
+function isBoolean(b: unknown): b is boolean {
+  return b === true || b === false;
+}
+
 export class SqsConsumer extends EventEmitter {
   protected queue!: string;
 
@@ -91,6 +94,10 @@ export class SqsConsumer extends EventEmitter {
 
   protected ackHandler!: AckHandler | DefaultAckHandler;
 
+  protected running = false;
+
+  private timeout!: Timeout;
+
   constructor(queue: string, handler: HandlerType, options: Options) {
     super();
     const {
@@ -103,8 +110,6 @@ export class SqsConsumer extends EventEmitter {
       deleteMessageInput,
       ackHandler,
     } = options;
-
-    console.log('here we go 1', clientConfig, credentialsProvider);
 
     if (client) {
       this.client = client;
@@ -122,176 +127,113 @@ export class SqsConsumer extends EventEmitter {
     this.deleteMessageInput = deleteMessageInput;
     this.pollingConfig = getPollingWithDefaults(polling);
     this.ack = ack;
-    this.ackHandler = ackHandler ?? (() => {});
+    this.ackHandler = ackHandler ?? (() => {
+      // intentionally do nothing
+    });
   }
 
   public start() {
-    this.poll();
-    // this is where we will start the timeout, or scheduler, or something to
-    // continuosly open the long polling connection.
-    // we may way to have a scheduler class that keeps track of the most recent
-    // success timestamp, which should start the timer for the next request
+    if (this.running) {
+      return;
+    }
+
+    const loop = () => {
+      this.poll(() => {
+        if (this.timeout) {
+          clearTimeout(this.timeout);
+        }
+        this.timeout = schedule(loop, 0);
+      });
+    };
+    this.running = true;
+    loop();
   }
 
   public stop() {
-
-  }
-
-  private deleteMessage(message: Message) {
-    console.log('we got a message to delete!!!', message);
-    // const input: DeleteMessageCommandInput = this.deleteMessageInput ?? { QueueUrl: this.queue };
-    // const command = new DeleteMEssj();
-  }
-
-  private handleHandlerResponse(messages: Message[], result: HandlerReturnType): void {
-    console.log('we got the result back from the handler!!!', result);
-
-    if (this.ack === true) {
-      console.log('ack is true so we will delete the messages from the queue');
-    }
-    // if (this.ack === true) {
-    //   // delete the message from the queue
-    //   this.deleteMessage();
-    // }
-  }
-
-  processHandlerResult(messages: Message[], result: boolean): void {
-    // unless the result is explicity false, we'll delete all of the mesages
-    if (this.ack === false && result === false) {
-      // ack is false, and the result was explicity false, so we wont delete the batch of messages
+    if (!this.running) {
       return;
     }
+    clearTimeout(this.timeout);
+    this.running = false;
+  }
 
+  processHandlerResult(messages: Message[], result: boolean[], done: Done): void {
     const entries: DeleteMessageBatchRequestEntry[] = [];
-    for (let i = 0; i < messages.length; i += 1) {
-      const entry: DeleteMessageBatchRequestEntry = {
-        Id: `${i}`,
-        ReceiptHandle: messages[i].ReceiptHandle,
-      };
-      entries.push(entry);
-    }
-    const command = new DeleteMessageBatchCommand({
-      QueueUrl: this.queue,
-      Entries: entries,
-    });
-
-    this.client.send(command, (err, data) => {
-      if (err) {
-        this.emit('ack-error', err, messages);
-        return;
+    for (let i = 0; i < result.length; i += 1) {
+      const ack = result[i];
+      if (this.ack === true || ack === true) {
+        const entry: DeleteMessageBatchRequestEntry = {
+          Id: `${i}`,
+          ReceiptHandle: messages[i].ReceiptHandle,
+        };
+        entries.push(entry);
       }
-      this.ackHandler(messages);
-    });
+    }
+
+    if (entries.length) {
+      this.deleteMessages(entries, done);
+    } else {
+      done();
+    }
   }
 
-  processHandlerResponse(response: HandlerReturnType): void {
-    // if (!isPromise<booleandd
-    if (response === undefined || typeof response === 'boolean') {
-      // consumer must call callback for anything to happen
+  private deleteMessages(entries: DeleteMessageBatchRequestEntry[], done: Done, depth = 0): void {
+    if (depth >= 4) {
+      done();
       return;
     }
-
-    if (isPromise<boolean>(response)) {
-      response.then((result) => this.processHandlerResult.bind(this));
-    }
-
-    //
-    // console.log(isPromise<boolean>(response));
-
-    // console.log(typeof response);
-
-    // if ()
-
-    // if (response === undefined || typeof response === 'boolean') {
-    //   // the consumer needs to call the callback
-    // } else if (response?.constructor?.name === 'Promise') {
-    //   // we're dealing with a promise, so the result of the resolved promise is the result we need
-    //   // to call the delete method
-    //   Promise.resolve(response).then(this.processHandlerResult.bind(this));
-    // } else if (typeof response === 'object' && isResultObject(response)) {
-    //   // the result is whether or
-    // }
-
-    // if (response )
+    this.client.send(
+      new DeleteMessageBatchCommand({ QueueUrl: this.queue, Entries: entries }),
+      (err) => {
+        if (err) {
+          return this.deleteMessages(entries, done, depth + 1);
+        }
+        return done();
+      },
+    );
   }
 
-  private handlerCallback(err: Error, result: boolean): void {
-    console.log('hello from insdie the callback', err, result);
-  }
-
-  async poll() {
+  poll(done: Done) {
     const cmd = new ReceiveMessageCommand(this.receiveMessageInput);
     this.client.send(cmd, (err, data) => {
       if (err) {
         this.emit('receive-error', err);
+        done();
         return;
       }
 
       if (data?.Messages) {
-        const response = this.handler(data.Messages, this.handlerCallback.bind(this));
+        const response = this.handler(data.Messages, (error, result) => {
+          if (error) {
+            // errors indicate that we shouldn't delete the messages from the queue
+            // these will eventually get cycled back into the queue and retried by this
+            // or another consumer
+            done();
+            return;
+          }
+          this.processHandlerResult(data.Messages ?? [], result, done);
+        });
+
         // if it's not a promise, the consumer is expected to call the callback directly
-        if (isPromise<boolean>(response)) {
-          response.then(this.processHandlerResult.bind(this, data.Messages));
+        if (isPromise<boolean[]>(response)) {
+          response.then((result) => {
+            if (Array.isArray(result) && result.every((v) => isBoolean(v))) {
+              // this is the only valid result
+              this.processHandlerResult(data.Messages ?? [], result, done);
+            } else {
+              // fail hard here, because the function either needs to return a promise that
+              // resolves to a valid result, or no promise at all and should instead invoke the
+              // callback.
+              throw new TypeError('handler returned a promise that did not resolve to a valid result. Did you mean to call the callback?');
+            }
+            // in this situation, the callback is expected to be called
+          });
         }
-        // this.processHandlerResponse(this.handler(data.Messages, this.handlerCallback.bind(this)));
-
-        // this.handleHandlerResponse(this.handler(data.Messages, this.handlerCallback.bind(this)));
-        // const result = this.handler(data.Messages, this.handlerCallback.bind(this));
-        // if (result?.constructor?.name === 'Promise') {
-        //   Promise.resolve(result).then((this.handleHandlerResponse.bind(this, data.Messages)));
-        //   return;
-        // } if (result === true || result === false) { // result !== undefined) {
-        //   console.log('result is not undefined');
-        //   this.handleHandlerResponse(data.Messages, result);
-        //   return;
-        // }
-
-        console.log('the response was undefined, which means the client has to call the callback');
+      } else {
+        // no data was received with the WaitTime. Calling the done function will ensure we
+        // poll again for more messages
+        done();
       }
     });
   }
-
-  // deleteMessages(data: R  {
-  //   console.log('were now deleting the thinging', data);
-  // }
-
-  // getMessages() {
-  //   const cmd = new ReceiveMessageCommand({
-  //     QueueUrl: this.queue,
-  //     // WaitTimeSeconds:
-  //   });
-  // }
-
-  // static async init(tmgConfig, configKey = 'sqs') {
-  //   return tmgConfig.proxy(
-  //     (nc) => new Consumer(nc, { logger: tmgConfig.logger }),
-  //     configKey,
-  //     ''
-  //   )
-  //  // const { config } = tmgConfig;
-  //
-  //  return tmgConfig.proxy(
-  //    (nc) => new Consumer(nc, { logger: tmgConfig.logger }),j
-  //  )
-  //  return tmgConfig.proxy(
-  //    (nc) => new Consumer(nc, { logger: tmgConfig.logger }),
-  //
-  //  )
-  //
-  // }
 }
-
-// const consumer = () => {
-//   // const { clientConfig } = config
-//
-//
-//   return {
-//     start() {
-//
-//     },
-//     stop() {
-//
-//     }
-//   }
-//
-// }
